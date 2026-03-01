@@ -53,5 +53,150 @@ from task.user_client import UserClient
 # Implement such application as described on the `flow.png` with adaptive vector based grounding and 'lite' version of
 # output grounding (verification that such user exist and fetch full user info)
 
+class HobbiesResponse(BaseModel):
+    hobbies: dict[str, list[int]] = Field(description="Dictionary mapping a hobby string to a list of user IDs who enjoy that hobby")
 
+EXTRACTION_PROMPT = """You are an expert entity extraction system.
 
+## Task:
+Extract hobbies mentioned in the user's request and find users from the provided context who enjoy those hobbies.
+
+## RAG CONTEXT:
+{context}
+
+## USER QUESTION:
+{query}
+
+## Instructions:
+1. Identify the core hobbies or activities the user is asking about.
+2. For each identified hobby, find the users in the context whose 'about_me' section indicates they enjoy it.
+3. Extract only the 'id' of those matching users.
+4. Output the result matching the provided JSON schema: a dictionary where keys are hobbies and values are lists of user IDs.
+5. Do not include users who do not explicitly match the requested hobbies.
+
+{format_instructions}
+"""
+
+class InOutGroundingApp:
+    def __init__(self):
+        self.embeddings = AzureOpenAIEmbeddings(
+            azure_deployment="text-embedding-3-small-1",
+            openai_api_version="2023-05-15",
+            dimensions=384,
+            azure_endpoint=DIAL_URL,
+            api_key=API_KEY
+        )
+        self.llm_client = AzureChatOpenAI(
+            azure_deployment="gpt-4o",
+            api_version="",
+            temperature=0.0,
+            azure_endpoint=DIAL_URL,
+            api_key=API_KEY
+        )
+        self.user_client = UserClient()
+        self.vectorstore = Chroma(
+            collection_name="users_about_me",
+            embedding_function=self.embeddings
+        )
+        self.parser = PydanticOutputParser(pydantic_object=HobbiesResponse)
+        self.prompt_template = ChatPromptTemplate.from_messages([
+            SystemMessagePromptTemplate.from_template(EXTRACTION_PROMPT)
+        ]).partial(format_instructions=self.parser.get_format_instructions())
+
+    async def _sync_users(self):
+        print("🔄 Syncing users with Chroma DB...")
+        current_users = self.user_client.get_all_users()
+        current_user_ids = {str(u['id']) for u in current_users}
+        
+        db_records = self.vectorstore.get()
+        db_user_ids = set(db_records['ids']) if db_records and 'ids' in db_records else set()
+        
+        # Find deleted users
+        deleted_ids = list(db_user_ids - current_user_ids)
+        if deleted_ids:
+            self.vectorstore.delete(ids=deleted_ids)
+            print(f"Removed {len(deleted_ids)} deleted users from DB.")
+            
+        # Find new users
+        new_ids = current_user_ids - db_user_ids
+        if new_ids:
+            new_docs = []
+            for u in current_users:
+                if str(u['id']) in new_ids:
+                    # Embed only ID and about_me
+                    content = f"ID: {u['id']}\nAbout Me: {u['about_me']}"
+                    doc = Document(page_content=content, id=str(u['id']))
+                    new_docs.append(doc)
+            
+            # Batch add documents
+            batch_size = 100
+            for i in range(0, len(new_docs), batch_size):
+                await self.vectorstore.aadd_documents(new_docs[i:i+batch_size])
+            print(f"Added {len(new_docs)} new users to DB.")
+            
+        print("✅ Sync complete.")
+        return current_users
+
+    async def process_query(self, query: str):
+        # 1. Sync DB and get full user list
+        all_users = await self._sync_users()
+        user_dict = {u['id']: u for u in all_users}
+        
+        # 2. Retrieve relevant context (vector search)
+        print("🔎 Retrieving relevant profiles...")
+        results = await self.vectorstore.asimilarity_search(query, k=20)
+        
+        if not results:
+            print("No relevant profiles found.")
+            return {}
+            
+        context_str = "\n\n".join([doc.page_content for doc in results])
+        
+        # 3. LLM Extraction (Named Entity Extraction)
+        print("🧠 Extracting entities via LLM...")
+        chain = self.prompt_template | self.llm_client | self.parser
+        extraction: HobbiesResponse = await chain.ainvoke({
+            "context": context_str,
+            "query": query
+        })
+        
+        # 4. Output Grounding
+        print("🔗 Performing output grounding...")
+        final_result = {}
+        for hobby, ids in extraction.hobbies.items():
+            valid_users = []
+            for uid in ids:
+                if uid in user_dict:
+                    valid_users.append(user_dict[uid])
+                else:
+                    # Fallback if DB sync race condition occurred or LLM hallucinated
+                    try:
+                        u = await self.user_client.get_user(uid)
+                        valid_users.append(u)
+                    except Exception:
+                        print(f"Warning: User ID {uid} not found during output grounding.")
+            
+            if valid_users:
+                final_result[hobby] = valid_users
+                
+        return final_result
+
+async def main():
+    app = InOutGroundingApp()
+    
+    print("\nWelcome to the Hobbies Searching Wizard!")
+    print("Example: 'I need people who love to go to mountains and like painting'")
+    
+    while True:
+        user_question = input("\n> ").strip()
+        if user_question.lower() in ['quit', 'exit']:
+            break
+            
+        result = await app.process_query(user_question)
+        
+        import json
+        print("\nFinal Output:")
+        print(json.dumps(result, indent=2))
+
+if __name__ == "__main__":
+    asyncio.run(main())
